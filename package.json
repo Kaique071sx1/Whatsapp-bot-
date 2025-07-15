@@ -1,0 +1,20 @@
+{
+  "name": "whatsapp-bot-baileys",
+  "version": "1.0.0",
+  "description": "Bot completo para WhatsApp usando Node.js e Baileys",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "Seu Nome",
+  "license": "ISC",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.2",
+    "chalk": "^4.1.2",
+    "child_process": "^1.0.2",
+    "fs": "^0.0.1-security",
+    "path": "^0.12.7",
+    "pino": "^8.21.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
