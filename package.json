@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node index.js"
   },
-  "author": "Seu Nome",
+  "author": "@Kaique071sx",
   "license": "ISC",
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.2",

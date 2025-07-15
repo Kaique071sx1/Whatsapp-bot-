@@ -15,7 +15,7 @@ apt update && apt upgrade -y
 echo -e "\n${YELLOW}Instalando Node.js, Git e outras dependências...${NC}"
 pkg install nodejs-lts git ffmpeg libwebp imagemagick -y
 
-# --- Instalar dependências do Node.js ---
+# --- Instalar dependências do projeto listadas no package.json ---
 echo -e "\n${YELLOW}Instalando as dependências do projeto via npm...${NC}"
 npm install
 

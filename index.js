@@ -6,8 +6,9 @@ const fs = require('fs');
 const readline = require('readline');
 const chalk = require('chalk');
 const { exec } = require('child_process');
+const qrcode = require('qrcode-terminal');
 
-const logger = require('./utils/logger'); // Nosso logger personalizado
+const logger = require('./utils/logger');
 
 let config = {};
 const commands = new Map();
@@ -23,11 +24,16 @@ function askQuestion(query) {
 
 async function setup() {
     if (fs.existsSync('config.json')) {
-        config = JSON.parse(fs.readFileSync('config.json'));
-        // Adiciona novas opções de configuração se não existirem
-        if (config.antiLink === undefined) config.antiLink = false; // Desativado por padrão
-        fs.writeFileSync('config.json', JSON.stringify(config, null, 2));
-        return;
+        try {
+            const fileContent = fs.readFileSync('config.json', 'utf-8');
+            if (fileContent.trim() === '') throw new Error("Arquivo config.json está vazio.");
+            config = JSON.parse(fileContent);
+            return;
+        } catch (error) {
+            logger.error(`Erro ao ler config.json: ${error.message}.`);
+            logger.warn("Excluindo config.json corrompido e reiniciando o setup.");
+            fs.unlinkSync('config.json');
+        }
     }
 
     console.log(chalk.yellow('--- SETUP INICIAL ---'));
@@ -45,52 +51,53 @@ async function setup() {
     rl.close();
 }
 
-// Carregar comandos (Plugin System)
-const commandFolders = readdirSync(path.join(__dirname, 'comandos'));
-for (const folder of commandFolders) {
-    const commandFiles = readdirSync(path.join(__dirname, 'comandos', folder)).filter(file => file.endsWith('.js'));
+try {
+    const commandFiles = readdirSync(path.join(__dirname, 'comandos')).filter(file => file.endsWith('.js'));
     for (const file of commandFiles) {
-        try {
-            const commandModule = require(path.join(__dirname, 'comandos', folder, file));
-            // Suporte para múltiplos comandos por arquivo
-            for (const commandName in commandModule) {
-                 const command = commandModule[commandName];
-                 if (command.name) {
+        const filePath = path.join(__dirname, 'comandos', file);
+        const commandModule = require(filePath);
+        if (commandModule.name && commandModule.run) {
+            commands.set(commandModule.name, commandModule);
+            logger.info(`Comando carregado: ${commandModule.name} (arquivo: ${file})`);
+        } else {
+            for (const key in commandModule) {
+                const command = commandModule[key];
+                if (command && command.name && command.run) {
                     commands.set(command.name, command);
-                    logger.info(`Comando carregado: ${command.name}`);
+                    logger.info(`Comando carregado: ${command.name} (arquivo: ${file})`);
                 }
             }
-        } catch (error) {
-            logger.error(`Erro ao carregar o comando ${file}:`, error);
         }
     }
+} catch (error) {
+    logger.error("Erro ao carregar comandos:", error);
 }
-
 
 async function connectToWhatsApp() {
     await setup();
     
     const { state, saveCreds } = await useMultiFileAuthState('session');
     const { version } = await fetchLatestBaileysVersion();
-    logger.info(`Usando Baileys v${version}`);
+    const versionString = version.version ? version.version.join('.') : 'desconhecida';
+    logger.info(`Usando Baileys v${versionString}`);
 
     const sock = makeWASocket({
         version,
-        printQRInTerminal: true,
         auth: state,
         logger: pino({ level: 'silent' }),
-        getMessage: async (key) => {
-            return { conversation: 'hello' };
-        }
+        getMessage: async (key) => ({ conversation: 'hello' })
     });
 
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
+        
         if (qr) {
-            logger.info('QR Code gerado, escaneie com seu celular.');
+            console.log(chalk.yellow('Abra o WhatsApp, vá em Aparelhos Conectados e escaneie o QR Code abaixo:'));
+            qrcode.generate(qr, { small: true });
         }
+        
         if (connection === 'close') {
             const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
             logger.error('Conexão fechada. Motivo:', lastDisconnect.error, `\nReconectando: ${shouldReconnect}`);
@@ -112,19 +119,15 @@ async function connectToWhatsApp() {
         const senderId = msg.key.participant || msg.sender;
         const isGroup = groupId.endsWith('@g.us');
         
-        // --- INÍCIO DO CÓDIGO INSERIDO ---
-
-        // Anti-link (apenas em grupos)
         if (isGroup && config.antiLink && body.match(/chat.whatsapp.com/)) {
             logger.warn(`Link detectado no grupo ${groupId} por ${senderId}`);
             try {
                 const groupMeta = await sock.groupMetadata(groupId);
                 const senderIsAdmin = groupMeta.participants.find(p => p.id === senderId)?.admin;
-        
                 if (!senderIsAdmin) {
                     await sock.sendMessage(groupId, { text: `🚫 Link detectado! ${msg.pushName} será removido.` });
                     await sock.groupParticipantsUpdate(groupId, [senderId], 'remove');
-                    return; // Interrompe o processamento para não executar comandos
+                    return; 
                 } else {
                     logger.info('Link enviado por um admin, ignorando.');
                 }
@@ -133,10 +136,6 @@ async function connectToWhatsApp() {
             }
         }
 
-        // --- FIM DO CÓDIGO INSERIDO ---
-
-
-        // Processamento de comandos
         if (!body.startsWith(config.prefix)) return;
         
         const args = body.slice(config.prefix.length).trim().split(/ +/);
@@ -145,11 +144,9 @@ async function connectToWhatsApp() {
 
         if (!command) return;
 
-        // Log
         logger.info(`Comando recebido: ${commandName} de ${msg.key.remoteJid}`);
 
         try {
-            // Checagens de permissão
             if (command.ownerOnly && senderId !== config.ownerId) {
                 return sock.sendMessage(groupId, { text: 'Apenas meu dono pode usar este comando!' }, { quoted: msg });
             }
@@ -171,9 +168,6 @@ async function connectToWhatsApp() {
         }
     });
 
-    // --- INÍCIO DO CÓDIGO INSERIDO ---
-
-    // Evento para Boas-Vindas/Saída
     sock.ev.on('group-participants.update', async (update) => {
         const { id, participants, action } = update;
         const user = participants[0];
@@ -187,39 +181,6 @@ async function connectToWhatsApp() {
             }
         } catch (e) {
             logger.error(`Erro no evento de boas-vindas/saída:`, e);
-        }
-    });
-
-    // --- FIM DO CÓDIGO INSERIDO ---
-    
-    // Comandos de reiniciar e atualizar (movidos para o dono.js seria o ideal, mas mantendo aqui por simplicidade)
-    commands.set('reiniciar', {
-        name: 'reiniciar',
-        ownerOnly: true,
-        async run(sock, msg, args, config) {
-            logger.warn('Reiniciando o bot...');
-            await sock.sendMessage(config.ownerId, { text: 'Reiniciando...' });
-            exec('node index.js', (err, stdout, stderr) => {
-                if (err) logger.error(err);
-                logger.info(stdout);
-            });
-            process.exit();
-        }
-    });
-    
-    commands.set('atualizar', {
-        name: 'atualizar',
-        ownerOnly: true,
-        async run(sock, msg, args, config) {
-            logger.info('Verificando atualizações...');
-            exec('git pull', (err, stdout, stderr) => {
-                if (err) return logger.error('Erro ao atualizar:', stderr);
-                if (stdout.includes('Already up to date.')) {
-                    return sock.sendMessage(config.ownerId, { text: 'O bot já está na versão mais recente.' });
-                }
-                sock.sendMessage(config.ownerId, { text: 'Bot atualizado com sucesso! Reiniciando...' });
-                process.exit();
-            });
         }
     });
 }

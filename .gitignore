@@ -1,0 +1,13 @@
+# Pasta da sessão - MUITO IMPORTANTE, contém suas chaves de login!
+session/
+
+# Arquivo de configuração - Contém seu número de telefone e outras configs
+config.json
+
+# Pasta de dependências - Gigante e desnecessária, recriada com 'npm install'
+node_modules/
+
+# Arquivos de log gerados
+logs.txt
+npm-debug.log*
+yarn-error.log*
