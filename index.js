@@ -13,6 +13,18 @@ const logger = require('./utils/logger');
 let config = {};
 const commands = new Map();
 
+// --- ARMAZENAMENTO E CACHE ---
+const warnings = {}; // Armazena as advertências: { groupId: { userId: count } }
+const processedMessages = new Set(); // Cache para evitar processamento duplicado de mensagens
+const groupSettingsPath = path.join(__dirname, 'groupSettings.json');
+
+function readGroupSettings() {
+    if (!fs.existsSync(groupSettingsPath)) return {};
+    try { return JSON.parse(fs.readFileSync(groupSettingsPath, 'utf-8')); }
+    catch { return {}; }
+}
+// --- FIM DO ARMAZENAMENTO ---
+
 const rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout
@@ -40,10 +52,8 @@ async function setup() {
     config.botName = await askQuestion(chalk.green('Qual o nome do bot? '));
     config.ownerName = await askQuestion(chalk.green('Qual o nome do dono? '));
     config.prefix = await askQuestion(chalk.green('Qual o prefixo para os comandos? (ex: !, /, .) '));
-    config.ownerId = await askQuestion(chalk.green('Qual o ID do dono? (ex: 5511999998888) '));
-    config.networkName = await askQuestion(chalk.green('Qual o nome da sua rede? (ex: Hendtrick Bot) '));
-    const antiLink = await askQuestion(chalk.green('Deseja ativar a proteção Anti-Link? (s/n) '));
-    config.antiLink = antiLink.toLowerCase() === 's';
+    config.ownerId = await askQuestion(chalk.green('Qual o ID do dono para notificações? (ex: 5511999998888) '));
+    config.networkName = await askQuestion(chalk.green('Qual o nome da sua rede/equipe? (ex: KS BOT-NET) '));
     config.ownerId = `${config.ownerId}@s.whatsapp.net`;
 
     fs.writeFileSync('config.json', JSON.stringify(config, null, 2));
@@ -52,14 +62,12 @@ async function setup() {
 }
 
 try {
-    const commandFiles = readdirSync(path.join(__dirname, 'comandos')).filter(file => file.endsWith('.js'));
-    for (const file of commandFiles) {
-        const filePath = path.join(__dirname, 'comandos', file);
-        const commandModule = require(filePath);
-        if (commandModule.name && commandModule.run) {
-            commands.set(commandModule.name, commandModule);
-            logger.info(`Comando carregado: ${commandModule.name} (arquivo: ${file})`);
-        } else {
+    const commandFolders = ['comandos'];
+    for (const folder of commandFolders) {
+        const commandFiles = readdirSync(path.join(__dirname, folder)).filter(file => file.endsWith('.js'));
+        for (const file of commandFiles) {
+            const filePath = path.join(__dirname, folder, file);
+            const commandModule = require(filePath);
             for (const key in commandModule) {
                 const command = commandModule[key];
                 if (command && command.name && command.run) {
@@ -78,10 +86,11 @@ async function connectToWhatsApp() {
     
     const { state, saveCreds } = await useMultiFileAuthState('session');
     const { version } = await fetchLatestBaileysVersion();
-    const versionString = version.version ? version.version.join('.') : 'desconhecida';
+    const versionString = version ? (version.version ? version.version.join('.') : 'desconhecida') : 'desconhecida';
     logger.info(`Usando Baileys v${versionString}`);
 
     const sock = makeWASocket({
+        browser: ['Bot-Termux', 'Chrome', '120.0.0.0'],
         version,
         auth: state,
         logger: pino({ level: 'silent' }),
@@ -114,28 +123,68 @@ async function connectToWhatsApp() {
         const msg = m.messages[0];
         if (!msg.message || msg.key.fromMe) return;
 
+        // --- LÓGICA ANTI-DUPLICIDADE ---
+        const msgId = msg.key.id;
+        if (processedMessages.has(msgId)) {
+            return; // Se a mensagem já foi processada, ignora.
+        }
+        processedMessages.add(msgId);
+        setTimeout(() => {
+            processedMessages.delete(msgId); // Remove a ID do cache após 5 segundos
+        }, 5000);
+        // --- FIM DA LÓGICA ANTI-DUPLICIDADE ---
+
         const body = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
         const groupId = msg.key.remoteJid;
         const senderId = msg.key.participant || msg.sender;
         const isGroup = groupId.endsWith('@g.us');
-        
-        if (isGroup && config.antiLink && body.match(/chat.whatsapp.com/)) {
-            logger.warn(`Link detectado no grupo ${groupId} por ${senderId}`);
-            try {
-                const groupMeta = await sock.groupMetadata(groupId);
-                const senderIsAdmin = groupMeta.participants.find(p => p.id === senderId)?.admin;
-                if (!senderIsAdmin) {
-                    await sock.sendMessage(groupId, { text: `🚫 Link detectado! ${msg.pushName} será removido.` });
-                    await sock.groupParticipantsUpdate(groupId, [senderId], 'remove');
-                    return; 
-                } else {
-                    logger.info('Link enviado por um admin, ignorando.');
+
+        // --- LÓGICA DO ANTI-LINK ATUALIZADA ---
+        if (isGroup) {
+            const groupSettings = readGroupSettings();
+            const isAntiLinkEnabled = groupSettings[groupId]?.antiLinkEnabled;
+
+            if (isAntiLinkEnabled && /https?:\/\//.test(body)) {
+                const groupMetadata = await sock.groupMetadata(groupId);
+                const senderIsAdmin = groupMetadata.participants.find(p => p.id === senderId)?.admin;
+
+                if (!senderIsAdmin && senderId !== config.ownerId) {
+                    logger.warn(`Link detectado de ${senderId} no grupo ${groupId}.`);
+                    
+                    // --- ADICIONADO: Deleta a mensagem com o link ---
+                    await sock.sendMessage(groupId, { delete: msg.key });
+
+                    if (!warnings[groupId]) warnings[groupId] = {};
+                    if (!warnings[groupId][senderId]) warnings[groupId][senderId] = 0;
+
+                    warnings[groupId][senderId]++;
+                    
+                    const warningCount = warnings[groupId][senderId];
+                    let replyText = '';
+
+                    switch (warningCount) {
+                        case 1:
+                            replyText = `1ª advertência para @${senderId.split('@')[0]}: você recebeu uma advertência ao enviar link no grupo.`;
+                            await sock.sendMessage(groupId, { text: replyText, mentions: [senderId] });
+                            break;
+                        case 2:
+                            replyText = `2ª advertência para @${senderId.split('@')[0]}: você recebeu outra advertência. Na próxima, será banido sem simpatia 😡`;
+                            await sock.sendMessage(groupId, { text: replyText, mentions: [senderId] });
+                            break;
+                        case 3:
+                        default:
+                            replyText = `Adeus, @${senderId.split('@')[0]}. Você descumpriu as regras do grupo 👋`;
+                            await sock.sendMessage(groupId, { text: replyText, mentions: [senderId] });
+                            await sock.groupParticipantsUpdate(groupId, [senderId], 'remove');
+                            warnings[groupId][senderId] = 0;
+                            break;
+                    }
+                    return;
                 }
-            } catch (e) {
-                logger.error('Erro na função anti-link:', e);
             }
         }
 
+        // --- Processamento de Comandos ---
         if (!body.startsWith(config.prefix)) return;
         
         const args = body.slice(config.prefix.length).trim().split(/ +/);
